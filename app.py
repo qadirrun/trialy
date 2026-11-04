@@ -1,130 +1,254 @@
 
-import streamlit as st
-from rapidfuzz import process, fuzz
+import io
 import re
 
-# Page configuration
+import pandas as pd
+import streamlit as st
+
+from rapidfuzz import fuzz, process, utils
+
+
+# ==========================================
+# PAGE CONFIGURATION
+# ==========================================
+
 st.set_page_config(
     page_title="Equipment Name Matcher",
+    page_icon="",
     layout="centered"
 )
 
 st.title("Equipment Name Matcher")
-st.caption("Find the 3 closest alternative names using fuzzy matching.")
+
+st.write(
+    "Find the closest benchmark equipment name "
+    "using your uploaded equipment catalogue."
+)
+
+
+# ==========================================
+# LOAD AND CACHE BENCHMARK EXCEL
+# ==========================================
+
+@st.cache_data(show_spinner="Loading benchmark catalogue...")
+def load_benchmark(file_bytes):
+
+    df = pd.read_excel(
+        io.BytesIO(file_bytes),
+        usecols=[0, 1],
+        dtype=str,
+        engine="openpyxl"
+    )
+
+    df.columns = ["code", "name"]
+
+    # Clean benchmark names
+    df["name"] = (
+        df["name"]
+        .fillna("")
+        .str.strip()
+    )
+
+    df = df[df["name"] != ""].copy()
+
+    # Normalize names for duplicate detection
+    df["normalized"] = df["name"].apply(
+        lambda x: utils.default_process(x) or ""
+    )
+
+    # Remove duplicate benchmark names
+    df = df[df["normalized"] != ""]
+
+    df = df.drop_duplicates(
+        subset=["normalized"],
+        keep="first"
+    )
+
+    return df[["code", "name"]].reset_index(drop=True)
+
+
+# ==========================================
+# PARSE ALTERNATIVE NAMES
+# ==========================================
+
+def parse_alternatives(description):
+
+    alternatives = re.split(
+        r"[|\n]+",
+        description
+    )
+
+    cleaned = []
+    seen = set()
+
+    for item in alternatives:
+
+        item = item.strip()
+
+        normalized = utils.default_process(item)
+
+        if normalized and normalized not in seen:
+            cleaned.append(item)
+            seen.add(normalized)
+
+    return cleaned
+
+
+# ==========================================
+# MATCHING ENGINE
+# ==========================================
+
+def find_best_matches(queries, benchmark_names):
+
+    best_scores = {}
+
+    for query in queries:
+
+        matches = process.extract(
+            query,
+            benchmark_names,
+            scorer=fuzz.WRatio,
+            processor=utils.default_process,
+            limit=3
+        )
+
+        for name, score, index in matches:
+
+            if (
+                index not in best_scores
+                or score > best_scores[index]["score"]
+            ):
+
+                best_scores[index] = {
+                    "name": name,
+                    "score": score,
+                    "index": index
+                }
+
+    # Rank all unique benchmark candidates
+    ranked = sorted(
+        best_scores.values(),
+        key=lambda x: (-x["score"], x["name"].lower())
+    )
+
+    return ranked[:3]
+
+
+# ==========================================
+# EXCEL UPLOAD
+# ==========================================
+
+uploaded_file = st.file_uploader(
+    "Upload Benchmark Excel",
+    type=["xlsx"]
+)
+
+if uploaded_file is None:
+
+    st.info("Upload your benchmark Excel file to begin.")
+
+    st.stop()
+
+
+try:
+
+    benchmark_df = load_benchmark(
+        uploaded_file.getvalue()
+    )
+
+    benchmark_names = benchmark_df["name"].tolist()
+
+    st.success(
+        f"Benchmark loaded: {len(benchmark_names):,} unique names"
+    )
+
+except Exception as e:
+
+    st.error(f"Unable to read Excel file: {e}")
+
+    st.stop()
+
+
+# ==========================================
+# USER INPUT
+# ==========================================
 
 st.divider()
 
-# Equipment name
-equipment = st.text_input(
+equipment_name = st.text_input(
     "Equipment Name",
-    placeholder="e.g. Analysis Time"
+    placeholder="Example: Analysis Time"
 )
 
-# Alternative names
-alternatives = st.text_area(
+alternative_text = st.text_area(
     "Alternative Names",
-    placeholder="quoted delivery time | timer | autonomy time | stress analysis required | life cycle analysis",
-    height=200
+    placeholder=(
+        "quoted delivery time | timer | autonomy time | "
+        "stress analysis required | TIME | TIMEPL"
+    ),
+    height=150
 )
 
+# ==========================================
+# RUN MATCHING
+# ==========================================
 
-# Matching function
-def find_best_matches(equipment, alternatives, limit=3):
+if st.button("Find Matching Equipment", type="primary"):
 
-    if not equipment.strip() or not alternatives.strip():
-        return []
+    if not equipment_name.strip():
 
-    # Split alternatives using | or newline
-    alternative_list = [
-        name.strip()
-        for name in re.split(r"[|\n]+", alternatives)
-        if name.strip()
-    ]
-
-    if not alternative_list:
-        return []
-
-    # Remove duplicate alternatives
-    alternative_list = list(dict.fromkeys(alternative_list))
-
-    # Find top 3 matches
-    results = process.extract(
-        equipment.strip(),
-        alternative_list,
-        scorer=fuzz.WRatio,
-        limit=limit
-    )
-
-    return [
-        {
-            "rank": index + 1,
-            "name": name,
-            "score": round(score, 2)
-        }
-        for index, (name, score, choice_index) in enumerate(results)
-    ]
-
-
-# Matching button
-if st.button("Find Top 3 Matches", type="primary", use_container_width=True):
-
-    if not equipment.strip():
         st.warning("Please enter an equipment name.")
-
-    elif not alternatives.strip():
-        st.warning("Please enter alternative names.")
 
     else:
 
-        results = find_best_matches(equipment, alternatives)
+        alternatives = parse_alternatives(
+            alternative_text
+        )
 
-        if results:
+        # Include the original equipment name as well
+        queries = [equipment_name.strip()] + alternatives
+
+        with st.spinner("Finding closest benchmark names..."):
+
+            results = find_best_matches(
+                queries,
+                benchmark_names
+            )
+
+        if not results:
+
+            st.warning("No matching equipment found.")
+
+        else:
 
             st.divider()
-            st.subheader("Top 3 Matching Results")
 
-            for result in results:
+            st.subheader("Top 3 Benchmark Matches")
 
-                st.markdown(f"**Rank {result['rank']}**")
+            results_df = pd.DataFrame([
+                {
+                    "Rank": i + 1,
+                    "Benchmark Name": result["name"],
+                    "Similarity (%)": round(result["score"], 2)
+                }
+                for i, result in enumerate(results)
+            ])
 
-                col1, col2 = st.columns([3, 1])
-
-                with col1:
-                    st.text_input(
-                        f"Alternative Name {result['rank']}",
-                        value=result["name"],
-                        disabled=True,
-                        key=f"name_{result['rank']}"
-                    )
-
-                with col2:
-                    st.metric(
-                        "Score",
-                        f"{result['score']}%"
-                    )
-
-                st.divider()
-
-            # Final output: all 3 nearest names
-            final_names = " | ".join(
-                result["name"] for result in results
-            )
-
-            st.subheader("Final Output")
-
-            st.text_area(
-                "final",
-                value=final_names,
-                disabled=True
-            )
-
-            st.download_button(
-                "Download Results (TXT)",
-                data=final_names,
-                file_name="equipment_matches.txt",
-                mime="text/plain",
+            st.dataframe(
+                results_df,
+                hide_index=True,
                 use_container_width=True
             )
 
-        else:
-            st.error("No matching alternatives found.")
+            st.divider()
+
+            st.subheader("Final Equipment Name")
+
+            selected_name = st.selectbox(
+                "Choose the correct benchmark name",
+                options=[r["name"] for r in results]
+            )
+
+            st.success(
+                f"Final selected equipment name: {selected_name}"
+            )
