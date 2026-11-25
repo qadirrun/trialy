@@ -4,6 +4,7 @@ import pandas as pd
 import pymupdf
 import tempfile
 import unicodedata
+import hashlib
 import re
 import math
 import time
@@ -45,12 +46,31 @@ st.set_page_config(
 st.title("Engineering Document Intelligence")
 
 st.caption(
-    "OCR, attribute matching and automatic "
-    "datasheet classification"
+    "Docling OCR and Excel-based "
+    "Engineering Datasheet Classification"
 )
 
-if "results" not in st.session_state:
-    st.session_state.results = []
+# ==========================================
+# SESSION STATE
+# ==========================================
+
+defaults = {
+    "results": [],
+    "master_profiles": {},
+    "master_weights": {},
+    "master_filename": None,
+    "master_loaded": False,
+    "master_summary": {},
+    "master_version": 0,
+    "pdf_version": 0,
+    "processed_files": set()
+}
+
+for key, value in defaults.items():
+
+    if key not in st.session_state:
+
+        st.session_state[key] = value
 
 # ==========================================
 # TEXT NORMALIZATION
@@ -58,22 +78,48 @@ if "results" not in st.session_state:
 
 def normalize(text):
 
-    text = unicodedata.normalize("NFKC", str(text))
+    text = unicodedata.normalize(
+        "NFKC",
+        str(text)
+    )
 
     text = text.lower()
 
-    text = re.sub(r"[\W_]+", " ", text)
+    text = re.sub(
+        r"[\W_]+",
+        " ",
+        text
+    )
 
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
 
     return text.strip()
 
 # ==========================================
-# LOAD DOCLING
+# FILE HASH
 # ==========================================
 
-@st.cache_resource(show_spinner=False)
-def load_converter(full_page_ocr, table_mode):
+def get_file_hash(file_bytes):
+
+    return hashlib.sha256(
+        file_bytes
+    ).hexdigest()
+
+# ==========================================
+# CACHE DOCLING MODEL
+# ==========================================
+
+@st.cache_resource(
+    show_spinner=False
+)
+def load_converter(
+    full_page_ocr,
+    table_mode
+):
 
     options = PdfPipelineOptions()
 
@@ -99,7 +145,7 @@ def load_converter(full_page_ocr, table_mode):
         device=AcceleratorDevice.CPU
     )
 
-    return DocumentConverter(
+    converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(
                 pipeline_options=options
@@ -107,8 +153,10 @@ def load_converter(full_page_ocr, table_mode):
         }
     )
 
+    return converter
+
 # ==========================================
-# BUILD CLASSIFICATION MASTERLIST
+# BUILD MASTERLIST PROFILES
 # ==========================================
 
 def build_masterlist(
@@ -129,6 +177,7 @@ def build_masterlist(
     ]
 
     if alias_col:
+
         selected_columns.append(alias_col)
 
     data = df[selected_columns].copy()
@@ -141,28 +190,58 @@ def build_masterlist(
     ]
 
     if alias_col:
+
         new_columns.append("aliases")
 
     data.columns = new_columns
 
-    data = data.replace(r"^\s*$", pd.NA, regex=True)
+    data = data.replace(
+        r"^\s*$",
+        pd.NA,
+        regex=True
+    )
+
+    # Support merged Excel hierarchy cells.
+    # Reset child hierarchy when parent changes.
 
     if forward_fill:
 
-        data["domain"] = data["domain"].ffill()
+        current_domain = None
+        current_group = None
+        current_entity = None
 
-        data["group"] = (
-            data.groupby("domain", sort=False)["group"]
-            .ffill()
-        )
+        for index, row in data.iterrows():
 
-        data["entity"] = (
-            data.groupby(
-                ["domain", "group"],
-                sort=False
-            )["entity"]
-            .ffill()
-        )
+            if pd.notna(row["domain"]):
+
+                domain = str(row["domain"]).strip()
+
+                if domain != current_domain:
+
+                    current_domain = domain
+                    current_group = None
+                    current_entity = None
+
+            if pd.notna(row["group"]):
+
+                group = str(row["group"]).strip()
+
+                if group != current_group:
+
+                    current_group = group
+                    current_entity = None
+
+            if pd.notna(row["entity"]):
+
+                current_entity = str(
+                    row["entity"]
+                ).strip()
+
+            data.at[index, "domain"] = current_domain
+
+            data.at[index, "group"] = current_group
+
+            data.at[index, "entity"] = current_entity
 
     data = data.dropna(
         subset=[
@@ -183,11 +262,14 @@ def build_masterlist(
             str(row["entity"]).strip()
         )
 
-        attribute = str(row["attribute"]).strip()
+        attribute = str(
+            row["attribute"]
+        ).strip()
 
         normalized = normalize(attribute)
 
         if not normalized:
+
             continue
 
         if normalized not in profiles[key]:
@@ -197,7 +279,8 @@ def build_masterlist(
                 "aliases": {normalized}
             }
 
-        # Optional synonym / alias column
+        # Optional aliases or synonyms.
+
         if alias_col and pd.notna(row["aliases"]):
 
             aliases = re.split(
@@ -215,8 +298,7 @@ def build_masterlist(
                         "aliases"
                     ].add(cleaned)
 
-    # Count how many entity profiles
-    # contain each attribute or alias.
+    # Count attribute frequency across entities.
 
     frequency = Counter()
 
@@ -234,7 +316,7 @@ def build_masterlist(
 
     total_profiles = len(profiles)
 
-    # Rare attributes receive higher weights.
+    # Distinctive attributes receive higher weights.
 
     weights = {
         term: 1 + math.log(
@@ -246,19 +328,22 @@ def build_masterlist(
     return dict(profiles), weights
 
 # ==========================================
-# EXTRACT PDF USING DOCLING
+# OCR PDF USING DOCLING
 # ==========================================
 
-def extract_pdf(pdf_bytes, converter):
+def extract_pdf(
+    pdf_bytes,
+    converter
+):
 
     with tempfile.TemporaryDirectory() as tmp:
 
-        path = Path(tmp) / "document.pdf"
+        pdf_path = Path(tmp) / "document.pdf"
 
-        path.write_bytes(pdf_bytes)
+        pdf_path.write_bytes(pdf_bytes)
 
         result = converter.convert(
-            path,
+            pdf_path,
             raises_on_error=False
         )
 
@@ -289,11 +374,17 @@ def extract_pdf(pdf_bytes, converter):
 
         warnings = []
 
-        # Extract text items directly.
+        # ----------------------------------
+        # Extract text blocks
+        # ----------------------------------
 
         for item in document.texts:
 
-            text = getattr(item, "text", "")
+            text = getattr(
+                item,
+                "text",
+                ""
+            )
 
             if text:
 
@@ -301,7 +392,9 @@ def extract_pdf(pdf_bytes, converter):
                     str(text).splitlines()
                 )
 
-        # Extract structured table cells.
+        # ----------------------------------
+        # Extract table cells
+        # ----------------------------------
 
         for index, table in enumerate(
             document.tables,
@@ -312,11 +405,17 @@ def extract_pdf(pdf_bytes, converter):
 
                 for cell in table.data.table_cells:
 
-                    text = getattr(cell, "text", "")
+                    text = getattr(
+                        cell,
+                        "text",
+                        ""
+                    )
 
                     if text:
 
-                        segments.append(str(text))
+                        segments.append(
+                            str(text)
+                        )
 
                 df = table.export_to_dataframe(
                     doc=document
@@ -333,19 +432,32 @@ def extract_pdf(pdf_bytes, converter):
                     f"Table {index}: {error}"
                 )
 
-        # Include Markdown as fallback evidence.
+        # ----------------------------------
+        # Markdown fallback
+        # ----------------------------------
 
         for line in markdown.splitlines():
 
             segments.extend(
-                re.split(r"[|:]", line)
+                re.split(
+                    r"[|:]",
+                    line
+                )
             )
 
-        cleaned_segments = {
-            normalize(segment)
-            for segment in segments
-            if normalize(segment)
-        }
+        # ----------------------------------
+        # Normalize extracted content
+        # ----------------------------------
+
+        cleaned_segments = set()
+
+        for segment in segments:
+
+            cleaned = normalize(segment)
+
+            if cleaned:
+
+                cleaned_segments.add(cleaned)
 
         return {
             "markdown": markdown,
@@ -354,14 +466,18 @@ def extract_pdf(pdf_bytes, converter):
             "tables": tables,
             "status": status,
             "warnings": warnings,
-            "detected_tables": len(document.tables)
+            "detected_tables": len(document.tables),
+            "detected_pictures": len(document.pictures)
         }
 
 # ==========================================
 # BUILD DOCUMENT PHRASE INDEX
 # ==========================================
 
-def build_phrase_index(segments, max_words):
+def build_phrase_index(
+    segments,
+    max_words
+):
 
     phrase_index = defaultdict(set)
 
@@ -390,7 +506,7 @@ def build_phrase_index(segments, max_words):
     }
 
 # ==========================================
-# ATTRIBUTE MATCHING
+# ATTRIBUTE MATCHING ENGINE
 # ==========================================
 
 def match_attributes(
@@ -408,6 +524,7 @@ def match_attributes(
     }
 
     if not all_terms:
+
         return {}
 
     max_words = max(
@@ -428,11 +545,11 @@ def match_attributes(
 
     matches = {}
 
-    # Match every unique term only once.
-
     for term in sorted(all_terms):
 
-        # Exact word-boundary phrase matching.
+        # ----------------------------------
+        # Exact matching
+        # ----------------------------------
 
         if term in all_phrases:
 
@@ -444,13 +561,18 @@ def match_attributes(
 
             continue
 
+        # ----------------------------------
+        # Fuzzy matching
+        # ----------------------------------
+
         if not enable_fuzzy:
+
             continue
 
-        # Prevent fuzzy matching of short
-        # abbreviations such as IP, AC or DC.
+        # Avoid fuzzy matching short abbreviations.
 
         if len(term) < 7:
+
             continue
 
         word_count = len(term.split())
@@ -467,6 +589,7 @@ def match_attributes(
             )
 
         if not candidates:
+
             continue
 
         best = process.extractOne(
@@ -489,7 +612,7 @@ def match_attributes(
     return matches
 
 # ==========================================
-# CLASSIFICATION ENGINE
+# DOCUMENT CLASSIFICATION
 # ==========================================
 
 def classify_document(
@@ -526,13 +649,12 @@ def classify_document(
 
         used_phrases = set()
 
-        # More distinctive attributes first.
         ordered_attributes = sorted(
             attributes.items(),
             key=lambda item: (
                 min(
-                    weights.get(a, 1.0)
-                    for a in item[1]["aliases"]
+                    weights.get(alias, 1.0)
+                    for alias in item[1]["aliases"]
                 ),
                 len(item[0])
             ),
@@ -553,13 +675,9 @@ def classify_document(
             total_weight += weight
 
             possible_matches = [
-
                 evidence[alias]
-
                 for alias in aliases
-
                 if alias in evidence
-
                 and evidence[alias]["matched_text"]
                 not in used_phrases
             ]
@@ -585,24 +703,22 @@ def classify_document(
 
             matched.append({
                 "Attribute": attribute_name,
-                "Matched OCR text": best["matched_text"],
+                "Matched OCR Text": best["matched_text"],
                 "Similarity (%)": round(
-                    best["similarity"], 2
+                    best["similarity"],
+                    2
                 ),
                 "Method": best["method"],
                 "Weight": round(weight, 3)
             })
 
         if total_weight == 0:
+
             continue
 
-        coverage = matched_weight / total_weight
-
-        # Combine weighted coverage with the
-        # amount of supporting evidence.
-        #
-        # Small entity profiles cannot dominate
-        # solely because of one matching attribute.
+        coverage = (
+            matched_weight / total_weight
+        )
 
         support = 1 - math.exp(
             -matched_weight / 5
@@ -633,13 +749,18 @@ def classify_document(
         reverse=True
     )
 
-    if not candidates:
+    # No matching evidence.
+
+    if not candidates or candidates[0]["Matched"] == 0:
 
         return {
             "best": None,
             "candidates": [],
             "status": "Review Required",
-            "reasons": ["No classification profiles"]
+            "margin": 0,
+            "reasons": [
+                "No matching attributes detected"
+            ]
         }
 
     best = candidates[0]
@@ -666,7 +787,10 @@ def classify_document(
             "Insufficient matched attributes"
         )
 
-    if len(candidates) > 1 and margin < minimum_margin:
+    if (
+        len(candidates) > 1
+        and margin < minimum_margin
+    ):
 
         reasons.append(
             "Multiple entities have similar scores"
@@ -687,49 +811,114 @@ def classify_document(
     }
 
 # ==========================================
-# EXPORT CLASSIFICATION RESULTS
+# BUILD SUMMARY DATAFRAME
 # ==========================================
 
-def create_excel(results):
+def build_summary(results):
 
     summary = []
-
-    attributes = []
 
     for result in results:
 
         classification = result.get(
-            "classification", {}
+            "classification",
+            {}
         )
 
         best = classification.get("best") or {}
 
         summary.append({
             "File Name": result["name"],
-            "Data Domain": best.get("Data Domain", ""),
-            "Data Group": best.get("Data Group", ""),
-            "Entity": best.get("Entity", ""),
-            "Match Score": best.get("Score", 0),
-            "Coverage (%)": best.get("Coverage", 0),
-            "Matched Attributes": best.get("Matched", 0),
+
+            "Data Domain": best.get(
+                "Data Domain",
+                "-"
+            ),
+
+            "Data Group": best.get(
+                "Data Group",
+                "-"
+            ),
+
+            "Entity": best.get(
+                "Entity",
+                "-"
+            ),
+
+            "Score (%)": best.get(
+                "Score",
+                0
+            ),
+
+            "Coverage (%)": best.get(
+                "Coverage",
+                0
+            ),
+
+            "Matched Attributes": best.get(
+                "Matched",
+                0
+            ),
+
             "Total Attributes": best.get(
-                "Total Attributes", 0
+                "Total Attributes",
+                0
             ),
+
             "Status": classification.get(
-                "status", "Failed"
+                "status",
+                "Failed"
             ),
+
+            "OCR Status": result.get(
+                "status",
+                ""
+            ),
+
             "Review Reason": "; ".join(
-                classification.get("reasons", [])
+                classification.get(
+                    "reasons",
+                    []
+                )
             ),
-            "OCR Status": result.get("status", ""),
-            "Processing Time": round(
-                result.get("time", 0), 2
+
+            "Time (s)": round(
+                result.get("time", 0),
+                2
             ),
-            "Error": result.get("error", "")
+
+            "Error": result.get(
+                "error",
+                ""
+            )
         })
 
+    return pd.DataFrame(summary)
+
+# ==========================================
+# EXPORT RESULTS TO EXCEL
+# ==========================================
+
+def create_excel(results):
+
+    summary_df = build_summary(results)
+
+    attributes = []
+
+    alternative_candidates = []
+
+    for result in results:
+
+        classification = result.get(
+            "classification",
+            {}
+        )
+
+        best = classification.get("best") or {}
+
         for match in best.get(
-            "matched_attributes", []
+            "matched_attributes",
+            []
         ):
 
             attributes.append({
@@ -740,14 +929,30 @@ def create_excel(results):
             })
 
         for missing in best.get(
-            "missing_attributes", []
+            "missing_attributes",
+            []
         ):
 
             attributes.append({
                 "File Name": result["name"],
                 "Entity": best.get("Entity", ""),
                 "Attribute": missing,
-                "Status": "Not detected"
+                "Status": "Not Detected"
+            })
+
+        for candidate in classification.get(
+            "candidates",
+            []
+        ):
+
+            alternative_candidates.append({
+                "File Name": result["name"],
+                "Data Domain": candidate["Data Domain"],
+                "Data Group": candidate["Data Group"],
+                "Entity": candidate["Entity"],
+                "Score": candidate["Score"],
+                "Matched": candidate["Matched"],
+                "Coverage": candidate["Coverage"]
             })
 
     buffer = io.BytesIO()
@@ -757,7 +962,7 @@ def create_excel(results):
         engine="openpyxl"
     ) as writer:
 
-        pd.DataFrame(summary).to_excel(
+        summary_df.to_excel(
             writer,
             sheet_name="Classification",
             index=False
@@ -769,15 +974,34 @@ def create_excel(results):
             index=False
         )
 
+        pd.DataFrame(alternative_candidates).to_excel(
+            writer,
+            sheet_name="Candidates",
+            index=False
+        )
+
+        # Prevent uploaded strings beginning with "="
+        # from becoming executable Excel formulas.
+
+        for worksheet in writer.book.worksheets:
+
+            for row in worksheet.iter_rows():
+
+                for cell in row:
+
+                    if cell.data_type == "f":
+
+                        cell.data_type = "s"
+
     return buffer.getvalue()
 
 # ==========================================
-# SIDEBAR CONFIGURATION
+# SIDEBAR SETTINGS
 # ==========================================
 
 with st.sidebar:
 
-    st.header("OCR Settings")
+    st.header("OCR Configuration")
 
     table_mode = st.selectbox(
         "Table recognition mode",
@@ -820,7 +1044,7 @@ with st.sidebar:
     )
 
     minimum_margin = st.slider(
-        "Minimum score gap between top entities",
+        "Minimum score difference",
         min_value=0,
         max_value=30,
         value=5
@@ -828,213 +1052,104 @@ with st.sidebar:
 
     st.divider()
 
+    st.header("Session Management")
+
+    if st.session_state.master_loaded:
+
+        st.success("Masterlist loaded")
+
+        st.caption(
+            st.session_state.master_filename
+        )
+
+    else:
+
+        st.warning("No masterlist loaded")
+
+    st.metric(
+        "Processed documents",
+        len(st.session_state.results)
+    )
+
     if st.button(
-        "Clear results",
+        "Clear Classification Results",
         use_container_width=True
     ):
 
+        # Keep masterlist loaded.
+
         st.session_state.results = []
+
+        st.session_state.processed_files = set()
+
+        st.session_state.pdf_version += 1
 
         st.rerun()
 
 # ==========================================
-# STEP 1: UPLOAD EXCEL MASTERLIST
+# MAIN NAVIGATION
 # ==========================================
 
-st.header("1. Upload Classification Masterlist")
+master_tab, pdf_tab, result_tab = st.tabs([
+    "Masterlist",
+    "PDF Classification",
+    "Results"
+])
 
-master_file = st.file_uploader(
-    "Upload Excel masterlist",
-    type=["xlsx"],
-    key="masterlist"
-)
+# ==========================================
+# TAB 1: MASTERLIST MANAGEMENT
+# ==========================================
 
-profiles = {}
+with master_tab:
 
-weights = {}
+    st.header("Classification Masterlist")
 
-if master_file:
+    # --------------------------------------
+    # MASTERLIST ALREADY SAVED
+    # --------------------------------------
 
-    try:
+    if st.session_state.master_loaded:
 
-        workbook = pd.ExcelFile(
-            io.BytesIO(master_file.getvalue()),
-            engine="openpyxl"
+        st.success(
+            "Masterlist is saved and ready to use. "
+            "You do not need to upload it again "
+            "during this session."
         )
 
-        sheet = st.selectbox(
-            "Select worksheet",
-            workbook.sheet_names
+        st.caption(
+            f"Active masterlist: "
+            f"{st.session_state.master_filename}"
         )
 
-        header_row = st.number_input(
-            "Excel header row",
-            min_value=1,
-            value=1
-        )
-
-        master_df = pd.read_excel(
-            workbook,
-            sheet_name=sheet,
-            header=int(header_row) - 1,
-            dtype=str
-        )
-
-        master_df.columns = [
-            str(column).strip()
-            for column in master_df.columns
-        ]
-
-        columns = list(master_df.columns)
-
-        with st.expander("Preview Excel masterlist"):
-
-            st.dataframe(
-                master_df,
-                use_container_width=True
-            )
-
-        if len(columns) < 4:
-
-            st.error(
-                "Masterlist requires at least four columns."
-            )
-
-            st.stop()
-
-        # Automatically suggest column mappings.
-
-        def default_column(name, fallback):
-
-            target = normalize(name)
-
-            for index, col in enumerate(columns):
-
-                if normalize(col) == target:
-                    return index
-
-            return min(fallback, len(columns) - 1)
-
-        st.subheader("Map Excel Columns")
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-
-            domain_col = st.selectbox(
-                "Data Domain column",
-                columns,
-                index=default_column(
-                    "Data Domain", 0
-                )
-            )
-
-            group_col = st.selectbox(
-                "Data Group column",
-                columns,
-                index=default_column(
-                    "Data Group", 1
-                )
-            )
-
-        with c2:
-
-            entity_col = st.selectbox(
-                "Entity column",
-                columns,
-                index=default_column(
-                    "Entity", 2
-                )
-            )
-
-            attribute_col = st.selectbox(
-                "Attribute column",
-                columns,
-                index=default_column(
-                    "Attribute", 3
-                )
-            )
-
-        alias_col = st.selectbox(
-            "Synonym / Alias column (optional)",
-            options=[None] + columns,
-            format_func=lambda x: (
-                "Not available" if x is None else x
-            )
-        )
-
-        forward_fill = st.checkbox(
-            "Fill blank hierarchy cells "
-            "(for merged Excel cells)",
-            value=True
-        )
-
-        selected_columns = [
-            domain_col,
-            group_col,
-            entity_col,
-            attribute_col
-        ]
-
-        if alias_col:
-            selected_columns.append(alias_col)
-
-        if len(set(selected_columns)) != len(
-            selected_columns
-        ):
-
-            st.error(
-                "Please select different columns "
-                "for each field."
-            )
-
-            st.stop()
-
-        profiles, weights = build_masterlist(
-            master_df,
-            domain_col,
-            group_col,
-            entity_col,
-            attribute_col,
-            forward_fill,
-            alias_col
-        )
-
-        if not profiles:
-
-            st.error(
-                "No valid classification profiles found."
-            )
-
-            st.stop()
-
-        domains = {key[0] for key in profiles}
-
-        groups = {
-            (key[0], key[1])
-            for key in profiles
-        }
-
-        total_attributes = sum(
-            len(attributes)
-            for attributes in profiles.values()
-        )
+        summary = st.session_state.master_summary
 
         c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric("Data Domains", len(domains))
+        c1.metric(
+            "Data Domains",
+            summary["domains"]
+        )
 
-        c2.metric("Data Groups", len(groups))
+        c2.metric(
+            "Data Groups",
+            summary["groups"]
+        )
 
-        c3.metric("Entity Profiles", len(profiles))
+        c3.metric(
+            "Entities",
+            summary["entities"]
+        )
 
-        c4.metric("Attributes", total_attributes)
-
-        st.success("Masterlist loaded successfully.")
+        c4.metric(
+            "Attributes",
+            summary["attributes"]
+        )
 
         profile_preview = []
 
-        for key, attributes in profiles.items():
+        for key, attributes in (
+            st.session_state.master_profiles.items()
+        ):
 
             profile_preview.append({
                 "Data Domain": key[0],
@@ -1043,499 +1158,1147 @@ if master_file:
                 "Attributes": len(attributes)
             })
 
-        with st.expander(
-            "View available classification profiles"
-        ):
+        st.subheader("Available Classification Profiles")
+
+        st.dataframe(
+            pd.DataFrame(profile_preview),
+            hide_index=True,
+            use_container_width=True
+        )
+
+        # View individual entity attributes.
+
+        profile_keys = list(
+            st.session_state.master_profiles.keys()
+        )
+
+        selected_profile = st.selectbox(
+            "Inspect entity attributes",
+            profile_keys,
+            format_func=lambda key: " / ".join(key)
+        )
+
+        if selected_profile:
+
+            attributes = (
+                st.session_state.master_profiles[
+                    selected_profile
+                ]
+            )
+
+            attribute_preview = []
+
+            for information in attributes.values():
+
+                attribute_preview.append({
+                    "Attribute": information["name"],
+                    "Aliases": "; ".join(
+                        sorted(information["aliases"])
+                    )
+                })
 
             st.dataframe(
-                pd.DataFrame(profile_preview),
+                pd.DataFrame(attribute_preview),
+                hide_index=True,
                 use_container_width=True
             )
 
-    except Exception as error:
-
-        st.error(f"Unable to load Excel: {error}")
-
-        st.stop()
-
-# ==========================================
-# STEP 2: UPLOAD PDF DATASHEETS
-# ==========================================
-
-st.divider()
-
-st.header("2. Upload PDF Datasheets")
-
-uploaded_files = st.file_uploader(
-    "Upload one or multiple PDF datasheets",
-    type=["pdf"],
-    accept_multiple_files=True,
-    key="pdf_files"
-)
-
-if not master_file:
-
-    st.info(
-        "Upload an Excel masterlist before classification."
-    )
-
-if uploaded_files:
-
-    st.caption(
-        f"{len(uploaded_files)} documents uploaded."
-    )
-
-# ==========================================
-# STEP 3: OCR AND CLASSIFICATION
-# ==========================================
-
-start = st.button(
-    "Extract & Classify Documents",
-    type="primary",
-    use_container_width=True,
-    disabled=not profiles or not uploaded_files
-)
-
-if start:
-
-    st.session_state.results = []
-
-    with st.spinner("Initializing Docling models..."):
-
-        converter = load_converter(
-            full_page_ocr,
-            table_mode
-        )
-
-    progress = st.progress(0)
-
-    message = st.empty()
-
-    for index, uploaded_file in enumerate(
-        uploaded_files,
-        start=1
-    ):
-
-        start_time = time.time()
-
-        filename = uploaded_file.name
-
-        pdf_bytes = uploaded_file.getvalue()
-
-        try:
-
-            message.info(
-                f"[{index}/{len(uploaded_files)}] "
-                f"Performing OCR: {filename}"
-            )
-
-            extracted = extract_pdf(
-                pdf_bytes,
-                converter
-            )
-
-            message.info(
-                f"[{index}/{len(uploaded_files)}] "
-                f"Classifying: {filename}"
-            )
-
-            classification = classify_document(
-                extracted["segments"],
-                profiles,
-                weights,
-                fuzzy_threshold,
-                enable_fuzzy,
-                minimum_score,
-                int(minimum_matches),
-                minimum_margin
-            )
-
-            if extracted["status"] == "partial_success":
-
-                classification["status"] = (
-                    "Review Required"
-                )
-
-                classification["reasons"].append(
-                    "Incomplete OCR conversion"
-                )
-
-            st.session_state.results.append({
-                "name": filename,
-                "pdf": pdf_bytes,
-                **extracted,
-                "classification": classification,
-                "time": time.time() - start_time
-            })
-
-        except Exception as error:
-
-            st.session_state.results.append({
-                "name": filename,
-                "pdf": pdf_bytes,
-                "status": "failed",
-                "error": str(error),
-                "time": time.time() - start_time
-            })
-
-        progress.progress(
-            index / len(uploaded_files)
-        )
-
-    message.success(
-        "Document extraction and classification completed."
-    )
-
-# ==========================================
-# STEP 4: CLASSIFICATION SUMMARY
-# ==========================================
-
-results = st.session_state.results
-
-if results:
-
-    st.divider()
-
-    st.header("3. Classification Results")
-
-    summary = []
-
-    for result in results:
-
-        classification = result.get(
-            "classification", {}
-        )
-
-        best = classification.get("best") or {}
-
-        summary.append({
-            "File Name": result["name"],
-            "Data Domain": best.get(
-                "Data Domain", "-"
-            ),
-            "Data Group": best.get(
-                "Data Group", "-"
-            ),
-            "Entity": best.get("Entity", "-"),
-            "Score (%)": best.get("Score", 0),
-            "Matched": best.get("Matched", 0),
-            "Status": classification.get(
-                "status", "Failed"
-            ),
-            "Time (s)": round(result["time"], 2)
-        })
-
-    summary_df = pd.DataFrame(summary)
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Documents", len(results))
-
-    c2.metric(
-        "Classified",
-        int(
-            (summary_df["Status"] == "Classified").sum()
-        )
-    )
-
-    c3.metric(
-        "Review Required",
-        int(
-            (
-                summary_df["Status"]
-                == "Review Required"
-            ).sum()
-        )
-    )
-
-    c4.metric(
-        "Failed",
-        int(
-            (summary_df["Status"] == "Failed").sum()
-        )
-    )
-
-    st.caption(
-        "Results requiring review display the suggested "
-        "classification, not a confirmed classification."
-    )
-
-    st.dataframe(
-        summary_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Score (%)": st.column_config.ProgressColumn(
-                "Match Score",
-                min_value=0,
-                max_value=100,
-                format="%.2f%%"
-            )
-        }
-    )
-
-    st.download_button(
-        "Download Classification Results (.xlsx)",
-        data=create_excel(results),
-        file_name="classification_results.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-"
-            "officedocument.spreadsheetml.sheet"
-        )
-    )
-
-    # ======================================
-    # STEP 5: DOCUMENT INSPECTION
-    # ======================================
-
-    st.divider()
-
-    st.header("4. Document Inspection")
-
-    selected_index = st.selectbox(
-        "Select document",
-        options=range(len(results)),
-        format_func=lambda i: results[i]["name"]
-    )
-
-    selected = results[selected_index]
-
-    if selected["status"] == "failed":
-
-        st.error(selected["error"])
-
-        st.stop()
-
-    classification = selected["classification"]
-
-    best = classification.get("best")
-
-    if classification["status"] == "Review Required":
+        st.divider()
 
         st.warning(
-            "Review Required: " +
-            "; ".join(classification["reasons"])
+            "Replacing the masterlist will clear "
+            "existing classification results."
+        )
+
+        if st.button(
+            "Replace Masterlist",
+            use_container_width=True
+        ):
+
+            st.session_state.master_profiles = {}
+
+            st.session_state.master_weights = {}
+
+            st.session_state.master_filename = None
+
+            st.session_state.master_loaded = False
+
+            st.session_state.master_summary = {}
+
+            st.session_state.results = []
+
+            st.session_state.processed_files = set()
+
+            st.session_state.master_version += 1
+
+            st.session_state.pdf_version += 1
+
+            st.rerun()
+
+    # --------------------------------------
+    # UPLOAD NEW MASTERLIST
+    # --------------------------------------
+
+    else:
+
+        st.info(
+            "Upload your Excel masterlist once "
+            "before classifying PDF documents."
+        )
+
+        master_file = st.file_uploader(
+            "Upload Excel Masterlist",
+            type=["xlsx"],
+            key=(
+                f"master_upload_"
+                f"{st.session_state.master_version}"
+            )
+        )
+
+        if master_file:
+
+            try:
+
+                workbook = pd.ExcelFile(
+                    io.BytesIO(
+                        master_file.getvalue()
+                    ),
+                    engine="openpyxl"
+                )
+
+                sheet = st.selectbox(
+                    "Select worksheet",
+                    workbook.sheet_names
+                )
+
+                header_row = st.number_input(
+                    "Excel header row",
+                    min_value=1,
+                    value=1
+                )
+
+                master_df = pd.read_excel(
+                    workbook,
+                    sheet_name=sheet,
+                    header=int(header_row) - 1,
+                    dtype=str
+                )
+
+                master_df.columns = [
+                    str(column).strip()
+                    for column in master_df.columns
+                ]
+
+                columns = list(
+                    master_df.columns
+                )
+
+                with st.expander(
+                    "Preview Masterlist",
+                    expanded=True
+                ):
+
+                    st.dataframe(
+                        master_df.head(100),
+                        use_container_width=True
+                    )
+
+                if len(columns) < 4:
+
+                    st.error(
+                        "Masterlist must contain "
+                        "at least four columns."
+                    )
+
+                elif len(set(columns)) != len(columns):
+
+                    st.error(
+                        "Excel contains duplicate "
+                        "column names."
+                    )
+
+                else:
+
+                    # --------------------------
+                    # COLUMN AUTO-DETECTION
+                    # --------------------------
+
+                    def default_column(
+                        name,
+                        fallback
+                    ):
+
+                        target = normalize(name)
+
+                        for index, column in enumerate(
+                            columns
+                        ):
+
+                            if normalize(column) == target:
+
+                                return index
+
+                        return min(
+                            fallback,
+                            len(columns) - 1
+                        )
+
+                    st.subheader(
+                        "Map Masterlist Columns"
+                    )
+
+                    c1, c2 = st.columns(2)
+
+                    with c1:
+
+                        domain_col = st.selectbox(
+                            "Data Domain",
+                            columns,
+                            index=default_column(
+                                "Data Domain",
+                                0
+                            )
+                        )
+
+                        group_col = st.selectbox(
+                            "Data Group",
+                            columns,
+                            index=default_column(
+                                "Data Group",
+                                1
+                            )
+                        )
+
+                    with c2:
+
+                        entity_col = st.selectbox(
+                            "Entity",
+                            columns,
+                            index=default_column(
+                                "Entity",
+                                2
+                            )
+                        )
+
+                        attribute_col = st.selectbox(
+                            "Attribute",
+                            columns,
+                            index=default_column(
+                                "Attribute",
+                                3
+                            )
+                        )
+
+                    alias_col = st.selectbox(
+                        "Synonym / Alias (Optional)",
+                        options=[None] + columns,
+                        format_func=lambda x: (
+                            "Not Available"
+                            if x is None
+                            else x
+                        )
+                    )
+
+                    forward_fill = st.checkbox(
+                        "Fill blank hierarchy cells "
+                        "(for merged Excel cells)",
+                        value=True
+                    )
+
+                    # --------------------------
+                    # SAVE MASTERLIST
+                    # --------------------------
+
+                    if st.button(
+                        "Save Masterlist",
+                        type="primary",
+                        use_container_width=True
+                    ):
+
+                        selected_columns = [
+                            domain_col,
+                            group_col,
+                            entity_col,
+                            attribute_col
+                        ]
+
+                        if alias_col:
+
+                            selected_columns.append(
+                                alias_col
+                            )
+
+                        if len(
+                            set(selected_columns)
+                        ) != len(selected_columns):
+
+                            st.error(
+                                "Please select "
+                                "different columns."
+                            )
+
+                        else:
+
+                            with st.spinner(
+                                "Building masterlist profiles..."
+                            ):
+
+                                profiles, weights = (
+                                    build_masterlist(
+                                        master_df,
+                                        domain_col,
+                                        group_col,
+                                        entity_col,
+                                        attribute_col,
+                                        forward_fill,
+                                        alias_col
+                                    )
+                                )
+
+                            if not profiles:
+
+                                st.error(
+                                    "No valid entity "
+                                    "profiles found."
+                                )
+
+                            else:
+
+                                st.session_state.master_profiles = (
+                                    profiles
+                                )
+
+                                st.session_state.master_weights = (
+                                    weights
+                                )
+
+                                st.session_state.master_filename = (
+                                    master_file.name
+                                )
+
+                                st.session_state.master_loaded = True
+
+                                st.session_state.master_summary = {
+
+                                    "domains": len({
+                                        key[0]
+                                        for key in profiles
+                                    }),
+
+                                    "groups": len({
+                                        (key[0], key[1])
+                                        for key in profiles
+                                    }),
+
+                                    "entities": len(
+                                        profiles
+                                    ),
+
+                                    "attributes": sum(
+                                        len(attributes)
+                                        for attributes
+                                        in profiles.values()
+                                    )
+                                }
+
+                                st.session_state.results = []
+
+                                st.session_state.processed_files = set()
+
+                                st.rerun()
+
+            except Exception as error:
+
+                st.error(
+                    f"Unable to load masterlist: {error}"
+                )
+
+# ==========================================
+# TAB 2: PDF CLASSIFICATION
+# ==========================================
+
+with pdf_tab:
+
+    st.header("PDF Datasheet Classification")
+
+    if not st.session_state.master_loaded:
+
+        st.warning(
+            "Please upload and save the Excel "
+            "masterlist in the Masterlist tab first."
         )
 
     else:
 
-        st.success("Document successfully classified.")
+        st.success(
+            "Using saved masterlist: "
+            f"{st.session_state.master_filename}"
+        )
 
-    # Classification information
+        uploaded_files = st.file_uploader(
+            "Upload PDF Datasheets",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=(
+                f"pdf_upload_"
+                f"{st.session_state.pdf_version}"
+            )
+        )
 
-    if best:
+        skip_duplicates = st.checkbox(
+            "Skip previously processed PDF files",
+            value=True
+        )
+
+        if uploaded_files:
+
+            st.caption(
+                f"{len(uploaded_files)} PDF file(s) uploaded."
+            )
+
+            preview_files = []
+
+            for uploaded_file in uploaded_files:
+
+                file_hash = get_file_hash(
+                    uploaded_file.getvalue()
+                )
+
+                already_processed = (
+                    file_hash in
+                    st.session_state.processed_files
+                )
+
+                preview_files.append({
+                    "File Name": uploaded_file.name,
+                    "Size (MB)": round(
+                        uploaded_file.size / 1024 / 1024,
+                        2
+                    ),
+                    "Status": (
+                        "Already Processed"
+                        if already_processed
+                        else "Ready"
+                    )
+                })
+
+            st.dataframe(
+                pd.DataFrame(preview_files),
+                hide_index=True,
+                use_container_width=True
+            )
+
+        # ----------------------------------
+        # START OCR
+        # ----------------------------------
+
+        start = st.button(
+            "Extract & Classify Documents",
+            type="primary",
+            use_container_width=True,
+            disabled=not uploaded_files
+        )
+
+        if start:
+
+            profiles = (
+                st.session_state.master_profiles
+            )
+
+            weights = (
+                st.session_state.master_weights
+            )
+
+            converter = None
+
+            try:
+
+                with st.spinner(
+                    "Initializing Docling..."
+                ):
+
+                    converter = load_converter(
+                        full_page_ocr,
+                        table_mode
+                    )
+
+            except Exception as error:
+
+                st.error(
+                    f"Unable to initialize Docling: {error}"
+                )
+
+            if converter is not None:
+
+                progress = st.progress(0)
+
+                status_message = st.empty()
+
+                classified_count = 0
+
+                review_count = 0
+
+                failed_count = 0
+
+                skipped_count = 0
+
+                total_files = len(uploaded_files)
+
+                for index, uploaded_file in enumerate(
+                    uploaded_files,
+                    start=1
+                ):
+
+                    filename = uploaded_file.name
+
+                    pdf_bytes = (
+                        uploaded_file.getvalue()
+                    )
+
+                    file_hash = get_file_hash(
+                        pdf_bytes
+                    )
+
+                    if (
+                        skip_duplicates
+                        and file_hash in
+                        st.session_state.processed_files
+                    ):
+
+                        skipped_count += 1
+
+                        progress.progress(
+                            index / total_files
+                        )
+
+                        continue
+
+                    start_time = time.time()
+
+                    try:
+
+                        status_message.info(
+                            f"[{index}/{total_files}] "
+                            f"OCR Processing: {filename}"
+                        )
+
+                        extracted = extract_pdf(
+                            pdf_bytes,
+                            converter
+                        )
+
+                        status_message.info(
+                            f"[{index}/{total_files}] "
+                            f"Classifying: {filename}"
+                        )
+
+                        classification = classify_document(
+                            extracted["segments"],
+                            profiles,
+                            weights,
+                            fuzzy_threshold,
+                            enable_fuzzy,
+                            minimum_score,
+                            int(minimum_matches),
+                            minimum_margin
+                        )
+
+                        # Mark incomplete OCR for review.
+
+                        if extracted["status"] == "partial_success":
+
+                            classification["status"] = (
+                                "Review Required"
+                            )
+
+                            classification["reasons"].append(
+                                "Incomplete OCR conversion"
+                            )
+
+                        if extracted["warnings"]:
+
+                            classification["status"] = (
+                                "Review Required"
+                            )
+
+                            classification["reasons"].append(
+                                "Table extraction warnings"
+                            )
+
+                        if classification["status"] == "Classified":
+
+                            classified_count += 1
+
+                        else:
+
+                            review_count += 1
+
+                        # Save results without clearing
+                        # previously processed documents.
+
+                        st.session_state.results.append({
+                            "name": filename,
+                            "pdf": pdf_bytes,
+                            "hash": file_hash,
+                            **extracted,
+                            "classification": classification,
+                            "time": (
+                                time.time() - start_time
+                            )
+                        })
+
+                        st.session_state.processed_files.add(
+                            file_hash
+                        )
+
+                    except Exception as error:
+
+                        failed_count += 1
+
+                        st.session_state.results.append({
+                            "name": filename,
+                            "pdf": pdf_bytes,
+                            "hash": file_hash,
+                            "status": "failed",
+                            "error": str(error),
+                            "time": (
+                                time.time() - start_time
+                            )
+                        })
+
+                    progress.progress(
+                        index / total_files
+                    )
+
+                status_message.success(
+                    "Batch processing completed."
+                )
+
+                c1, c2, c3, c4 = st.columns(4)
+
+                c1.metric(
+                    "Classified",
+                    classified_count
+                )
+
+                c2.metric(
+                    "Review Required",
+                    review_count
+                )
+
+                c3.metric(
+                    "Failed",
+                    failed_count
+                )
+
+                c4.metric(
+                    "Skipped",
+                    skipped_count
+                )
+
+                st.info(
+                    "Open the Results tab to inspect "
+                    "the classification output."
+                )
+
+        # ----------------------------------
+        # UPLOAD ANOTHER BATCH
+        # ----------------------------------
+
+        if st.button(
+            "Upload Another Batch",
+            use_container_width=True
+        ):
+
+            # Reset only PDF uploader.
+            # Masterlist and results remain saved.
+
+            st.session_state.pdf_version += 1
+
+            st.rerun()
+
+# ==========================================
+# TAB 3: CLASSIFICATION RESULTS
+# ==========================================
+
+with result_tab:
+
+    st.header("Classification Results")
+
+    results = st.session_state.results
+
+    if not results:
+
+        st.info(
+            "No classification results available."
+        )
+
+    else:
+
+        summary_df = build_summary(results)
 
         c1, c2, c3, c4 = st.columns(4)
 
         c1.metric(
-            "Suggested Data Domain",
-            best["Data Domain"]
+            "Total Documents",
+            len(results)
         )
 
         c2.metric(
-            "Suggested Data Group",
-            best["Data Group"]
+            "Classified",
+            int(
+                (
+                    summary_df["Status"]
+                    == "Classified"
+                ).sum()
+            )
         )
 
         c3.metric(
-            "Suggested Entity",
-            best["Entity"]
+            "Review Required",
+            int(
+                (
+                    summary_df["Status"]
+                    == "Review Required"
+                ).sum()
+            )
         )
 
         c4.metric(
-            "Match Score",
-            f"{best['Score']:.2f}%"
+            "Failed",
+            int(
+                (
+                    summary_df["Status"]
+                    == "Failed"
+                ).sum()
+            )
         )
+
+        # ----------------------------------
+        # RESULT FILTER
+        # ----------------------------------
+
+        status_filter = st.multiselect(
+            "Filter classification status",
+            [
+                "Classified",
+                "Review Required",
+                "Failed"
+            ],
+            default=[
+                "Classified",
+                "Review Required",
+                "Failed"
+            ]
+        )
+
+        filtered_df = summary_df[
+            summary_df["Status"].isin(
+                status_filter
+            )
+        ]
 
         st.caption(
-            f"Matched {best['Matched']} of "
-            f"{best['Total Attributes']} attributes | "
-            f"Weighted coverage: {best['Coverage']}%"
+            "Review Required results show suggested "
+            "classifications, not confirmed entities."
         )
 
-    left, right = st.columns([1, 1])
-
-    # ======================================
-    # PDF PREVIEW
-    # ======================================
-
-    with left:
-
-        st.subheader("Original PDF")
-
-        with pymupdf.open(
-            stream=selected["pdf"],
-            filetype="pdf"
-        ) as pdf:
-
-            page_number = st.number_input(
-                "Page",
-                min_value=1,
-                max_value=len(pdf),
-                value=1,
-                key=f"page_{selected_index}"
-            )
-
-            page = pdf[int(page_number) - 1]
-
-            pix = page.get_pixmap(
-                matrix=pymupdf.Matrix(1.5, 1.5)
-            )
-
-            st.image(
-                pix.tobytes("png"),
-                use_container_width=True
-            )
-
-    # ======================================
-    # CLASSIFICATION AND OCR RESULTS
-    # ======================================
-
-    with right:
-
-        st.subheader("Analysis")
-
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "Candidates",
-            "Matched",
-            "Missing",
-            "OCR",
-            "Tables"
-        ])
-
-        with tab1:
-
-            candidate_df = pd.DataFrame([
-                {
-                    "Data Domain": item["Data Domain"],
-                    "Data Group": item["Data Group"],
-                    "Entity": item["Entity"],
-                    "Score": item["Score"],
-                    "Matched": item["Matched"],
-                    "Coverage": item["Coverage"]
-                }
-                for item in classification["candidates"]
-            ])
-
-            if not candidate_df.empty:
-
-                st.dataframe(
-                    candidate_df,
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={
-                        "Score":
-                        st.column_config.ProgressColumn(
-                            "Score",
-                            min_value=0,
-                            max_value=100,
-                            format="%.2f%%"
-                        )
-                    }
-                )
-
-                st.bar_chart(
-                    candidate_df.assign(
-                        Profile=(
-                            candidate_df["Data Domain"]
-                            + " / "
-                            + candidate_df["Data Group"]
-                            + " / "
-                            + candidate_df["Entity"]
-                        )
-                    ).set_index("Profile")["Score"]
-                )
-
-        with tab2:
-
-            if best and best["matched_attributes"]:
-
-                st.dataframe(
-                    pd.DataFrame(
-                        best["matched_attributes"]
+        st.dataframe(
+            filtered_df,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Score (%)":
+                    st.column_config.ProgressColumn(
+                        "Match Score",
+                        min_value=0,
+                        max_value=100,
+                        format="%.2f%%"
                     ),
-                    hide_index=True,
-                    use_container_width=True
+
+                "Coverage (%)":
+                    st.column_config.ProgressColumn(
+                        "Attribute Coverage",
+                        min_value=0,
+                        max_value=100,
+                        format="%.2f%%"
+                    )
+            }
+        )
+
+        st.download_button(
+            "Download All Results (.xlsx)",
+            data=create_excel(results),
+            file_name="classification_results.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
+            use_container_width=True
+        )
+
+        # ----------------------------------
+        # DOCUMENT INSPECTION
+        # ----------------------------------
+
+        st.divider()
+
+        st.subheader("Document Inspection")
+
+        selected_index = st.selectbox(
+            "Select PDF document",
+            options=list(
+                range(len(results))
+            ),
+            format_func=lambda index: (
+                f"{index + 1}. "
+                f"{results[index]['name']}"
+            )
+        )
+
+        selected = results[selected_index]
+
+        if selected["status"] == "failed":
+
+            st.error(
+                selected.get(
+                    "error",
+                    "Unknown processing error"
+                )
+            )
+
+        else:
+
+            classification = (
+                selected["classification"]
+            )
+
+            best = classification.get("best")
+
+            if classification["status"] == "Classified":
+
+                st.success(
+                    "Document successfully classified."
                 )
 
             else:
 
-                st.warning("No matched attributes.")
-
-        with tab3:
-
-            st.caption(
-                "These attributes were not detected "
-                "in the extracted PDF content."
-            )
+                st.warning(
+                    "Review Required: "
+                    + "; ".join(
+                        classification["reasons"]
+                    )
+                )
 
             if best:
 
-                st.dataframe(
-                    pd.DataFrame({
-                        "Attribute":
-                        best["missing_attributes"]
-                    }),
-                    hide_index=True,
-                    use_container_width=True
+                c1, c2, c3, c4 = st.columns(4)
+
+                c1.metric(
+                    "Data Domain",
+                    best["Data Domain"]
                 )
 
-        with tab4:
-
-            filename = Path(selected["name"]).stem
-
-            st.download_button(
-                "Download Markdown",
-                selected["markdown"],
-                file_name=f"{filename}.md",
-                mime="text/markdown"
-            )
-
-            st.download_button(
-                "Download JSON",
-                selected["json"],
-                file_name=f"{filename}.json",
-                mime="application/json"
-            )
-
-            with st.container(height=650):
-
-                st.markdown(
-                    selected["markdown"]
+                c2.metric(
+                    "Data Group",
+                    best["Data Group"]
                 )
 
-        with tab5:
+                c3.metric(
+                    "Entity",
+                    best["Entity"]
+                )
 
-            for warning in selected["warnings"]:
+                c4.metric(
+                    "Match Score",
+                    f"{best['Score']:.2f}%"
+                )
 
-                st.warning(warning)
+                st.caption(
+                    f"Matched {best['Matched']} of "
+                    f"{best['Total Attributes']} attributes"
+                    f" | Coverage: {best['Coverage']}%"
+                    f" | Score gap: "
+                    f"{classification['margin']}%"
+                )
 
-            if not selected["tables"]:
+            else:
 
-                st.warning("No tables extracted.")
+                st.warning(
+                    "No suitable entity identified."
+                )
 
-            for index, table in enumerate(
-                selected["tables"]
-            ):
+            st.caption(
+                f"Processing time: "
+                f"{selected['time']:.2f} seconds"
+                f" | Tables: "
+                f"{selected['detected_tables']}"
+                f" | Pictures: "
+                f"{selected['detected_pictures']}"
+            )
 
-                with st.expander(
-                    table["name"],
-                    expanded=(index == 0)
-                ):
+            left, right = st.columns([1, 1])
 
-                    st.dataframe(
-                        table["data"],
-                        use_container_width=True
-                    )
+            # ------------------------------
+            # ORIGINAL PDF PREVIEW
+            # ------------------------------
 
-                    st.download_button(
-                        "Download CSV",
-                        table["data"].to_csv(
-                            index=False
-                        ),
-                        file_name=f"table_{index+1}.csv",
-                        mime="text/csv",
-                        key=(
-                            f"table_{selected_index}_{index}"
+            with left:
+
+                st.subheader("Original PDF")
+
+                try:
+
+                    with pymupdf.open(
+                        stream=selected["pdf"],
+                        filetype="pdf"
+                    ) as pdf:
+
+                        page_number = st.number_input(
+                            "Page",
+                            min_value=1,
+                            max_value=len(pdf),
+                            value=1,
+                            key=f"page_{selected_index}"
                         )
+
+                        page = pdf[
+                            int(page_number) - 1
+                        ]
+
+                        pix = page.get_pixmap(
+                            matrix=pymupdf.Matrix(
+                                1.5,
+                                1.5
+                            )
+                        )
+
+                        st.image(
+                            pix.tobytes("png"),
+                            use_container_width=True
+                        )
+
+                except Exception as error:
+
+                    st.error(
+                        f"PDF preview failed: {error}"
                     )
+
+            # ------------------------------
+            # ANALYSIS RESULTS
+            # ------------------------------
+
+            with right:
+
+                st.subheader("Document Analysis")
+
+                (
+                    candidate_tab,
+                    matched_tab,
+                    missing_tab,
+                    ocr_tab,
+                    table_tab
+                ) = st.tabs([
+                    "Candidates",
+                    "Matched",
+                    "Missing",
+                    "OCR",
+                    "Tables"
+                ])
+
+                # --------------------------
+                # ALTERNATIVE CANDIDATES
+                # --------------------------
+
+                with candidate_tab:
+
+                    candidate_df = pd.DataFrame([
+                        {
+                            "Data Domain":
+                                candidate["Data Domain"],
+
+                            "Data Group":
+                                candidate["Data Group"],
+
+                            "Entity":
+                                candidate["Entity"],
+
+                            "Score":
+                                candidate["Score"],
+
+                            "Matched":
+                                candidate["Matched"],
+
+                            "Coverage":
+                                candidate["Coverage"]
+                        }
+                        for candidate
+                        in classification["candidates"]
+                    ])
+
+                    if candidate_df.empty:
+
+                        st.warning(
+                            "No matching candidates."
+                        )
+
+                    else:
+
+                        st.dataframe(
+                            candidate_df,
+                            hide_index=True,
+                            use_container_width=True,
+                            column_config={
+                                "Score":
+                                st.column_config.ProgressColumn(
+                                    "Match Score",
+                                    min_value=0,
+                                    max_value=100,
+                                    format="%.2f%%"
+                                )
+                            }
+                        )
+
+                        chart_df = candidate_df.copy()
+
+                        chart_df["Profile"] = (
+                            chart_df["Data Group"]
+                            + " / "
+                            + chart_df["Entity"]
+                        )
+
+                        st.bar_chart(
+                            chart_df.set_index(
+                                "Profile"
+                            )["Score"]
+                        )
+
+                # --------------------------
+                # MATCHED ATTRIBUTES
+                # --------------------------
+
+                with matched_tab:
+
+                    if (
+                        best
+                        and best["matched_attributes"]
+                    ):
+
+                        st.dataframe(
+                            pd.DataFrame(
+                                best["matched_attributes"]
+                            ),
+                            hide_index=True,
+                            use_container_width=True
+                        )
+
+                    else:
+
+                        st.warning(
+                            "No matched attributes."
+                        )
+
+                # --------------------------
+                # MISSING ATTRIBUTES
+                # --------------------------
+
+                with missing_tab:
+
+                    st.caption(
+                        "Attributes not detected in "
+                        "the extracted PDF content."
+                    )
+
+                    if best:
+
+                        st.dataframe(
+                            pd.DataFrame({
+                                "Attribute":
+                                best["missing_attributes"]
+                            }),
+                            hide_index=True,
+                            use_container_width=True
+                        )
+
+                # --------------------------
+                # OCR OUTPUT
+                # --------------------------
+
+                with ocr_tab:
+
+                    filename = Path(
+                        selected["name"]
+                    ).stem
+
+                    c1, c2 = st.columns(2)
+
+                    with c1:
+
+                        st.download_button(
+                            "Download Markdown",
+                            selected["markdown"],
+                            file_name=f"{filename}.md",
+                            mime="text/markdown"
+                        )
+
+                    with c2:
+
+                        st.download_button(
+                            "Download JSON",
+                            selected["json"],
+                            file_name=f"{filename}.json",
+                            mime="application/json"
+                        )
+
+                    with st.container(height=650):
+
+                        st.markdown(
+                            selected["markdown"]
+                        )
+
+                # --------------------------
+                # EXTRACTED TABLES
+                # --------------------------
+
+                with table_tab:
+
+                    for warning in selected["warnings"]:
+
+                        st.warning(warning)
+
+                    if not selected["tables"]:
+
+                        st.warning(
+                            "No tables extracted."
+                        )
+
+                    for index, table in enumerate(
+                        selected["tables"]
+                    ):
+
+                        with st.expander(
+                            table["name"],
+                            expanded=(index == 0)
+                        ):
+
+                            st.dataframe(
+                                table["data"],
+                                use_container_width=True
+                            )
+
+                            st.download_button(
+                                "Download CSV",
+                                table["data"].to_csv(
+                                    index=False
+                                ).encode("utf-8-sig"),
+                                file_name=(
+                                    f"{Path(selected['name']).stem}"
+                                    f"_table_{index + 1}.csv"
+                                ),
+                                mime="text/csv",
+                                key=(
+                                    f"csv_"
+                                    f"{selected_index}_"
+                                    f"{index}"
+                                )
+                            )
