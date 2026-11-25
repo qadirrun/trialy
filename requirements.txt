@@ -4,3 +4,7 @@ openpyxl
 rapidfuzz
 scikit-learn
 numpy
+docling
+rapidocr
+onnxruntime
+pymupdf
